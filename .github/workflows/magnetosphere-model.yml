@@ -88,13 +88,28 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config rebase.autoStash true
           git add data/magnetosphere/latest.json
           if git diff --cached --quiet; then
             echo "Snapshot is unchanged"
           else
             git commit -m "Update magnetosphere snapshot"
-            git pull --rebase origin main
-            git push origin HEAD:main
+            pushed=false
+            for attempt in 1 2 3 4 5; do
+              echo "Push attempt ${attempt}/5"
+              git fetch origin main
+              git rebase --autostash origin/main
+              if git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "main changed during push; retrying..."
+              sleep $((attempt * 2))
+            done
+            if [ "$pushed" != true ]; then
+              echo "Failed to publish snapshot after 5 attempts"
+              exit 1
+            fi
           fi
 
       - name: Assemble static site
