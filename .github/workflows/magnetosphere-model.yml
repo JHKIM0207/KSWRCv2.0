@@ -48,19 +48,14 @@ jobs:
       - name: Install field-model dependencies
         run: |
           python -m pip install --disable-pip-version-check -r requirements-magnetosphere.txt
-          python - <<'PY'
-          import site
-          import urllib.request
-          from pathlib import Path
-
-          target = Path(site.getsitepackages()[0]) / 'geopack' / 'igrf_coeffs' / 'igrf14coeffs.txt'
-          target.parent.mkdir(parents=True, exist_ok=True)
-          urllib.request.urlretrieve(
-              'https://www.ngdc.noaa.gov/IAGA/vmod/coeffs/igrf14coeffs.txt',
-              target,
-          )
-          print(f'Installed {target}')
-          PY
+          GEOPACK_DIR="$(python -c "from importlib.metadata import distribution; print(distribution('geopack').locate_file('geopack'))")"
+          mkdir -p "$GEOPACK_DIR/igrf_coeffs"
+          curl --fail --location --retry 3 \
+            'https://www.ngdc.noaa.gov/IAGA/vmod/coeffs/igrf14coeffs.txt' \
+            --output "$GEOPACK_DIR/igrf_coeffs/igrf14coeffs.txt"
+          test -s "$GEOPACK_DIR/igrf_coeffs/igrf14coeffs.txt"
+          ls -l "$GEOPACK_DIR/igrf_coeffs"
+          python -c "from geopack import geopack; print('IGRF coefficients loaded successfully')"
 
       - name: Generate IGRF-14 and T96 snapshot
         run: python scripts/generate-magnetosphere.py
