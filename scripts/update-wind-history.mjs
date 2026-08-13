@@ -8,50 +8,42 @@ const MAG_URL = 'https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json';
 const DIR = path.join(process.cwd(), 'data', 'wind-history');
 const KEEP_DAYS = 5;
 
+function parseNoaaJson(text) {
+  // NOAA occasionally emits bare NaN/Infinity values, which are invalid JSON.
+  // Replace only values outside quoted strings and preserve the rest verbatim.
+  const normalized = text.replace(
+    /([:[,]\s*)(?:NaN|[+-]?Infinity)(?=\s*[,}\]])/g,
+    '$1null'
+  );
+  return JSON.parse(normalized);
+}
+
 async function fetchJson(url, attempts = 3) {
   let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const r = await fetch(url, {
-        cache: 'no-store',
-        headers: { 'User-Agent': 'KSWRC-GitHub-Actions/1.0' }
-      });
-      if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
-      const data = await r.json();
-      if (!Array.isArray(data)) throw new Error(`${url} -> expected a JSON array`);
-      return data;
-    } catch (error) {
-      lastError = error;
-      console.warn(`Fetch attempt ${attempt}/${attempts} failed for ${url}: ${error.message}`);
-      if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, attempt * 1500));
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return parseNoaaJson(await r.text());
+    } catch (e) {
+      lastError = e;
+      console.warn(`Fetch attempt ${attempt}/${attempts} failed for ${url}: ${e.message}`);
+      if (attempt < attempts) await new Promise(resolve => setTimeout(resolve, attempt * 1000));
     }
   }
   throw lastError;
 }
 
-function finiteValue(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-// NOAA's replacement RTSW products expose all spacecraft and use `active` as
-// an operational-spacecraft flag, not as a measurement-quality flag. Prefer
-// the active spacecraft, but retain a valid inactive source when no active row
-// exists for that timestamp (for example during a forecaster source switch).
-function preferredRows(rows, fields, requireAll = false) {
-  const byTime = new Map();
-  for (const row of rows || []) {
-    if (!row?.time_tag) continue;
-    const t = Date.parse(/Z$|[+-]\d\d:?\d\d$/.test(row.time_tag) ? row.time_tag : row.time_tag + 'Z');
+function activeRows(rows) {
+  const seen = new Set(), out = [];
+  for (const r of rows || []) {
+    if (!r.active || !r.time_tag || seen.has(r.time_tag)) continue;
+    seen.add(r.time_tag);
+    const t = Date.parse(/Z$|[+-]\d\d:?\d\d$/.test(r.time_tag) ? r.time_tag : r.time_tag + 'Z');
     if (!Number.isFinite(t)) continue;
-    const validCount = fields.reduce((count, field) => count + (finiteValue(row[field]) !== null ? 1 : 0), 0);
-    if (!validCount || (requireAll && validCount !== fields.length)) continue;
-    const candidate = { t, r: row, score: (row.active === true ? 100 : 0) + validCount };
-    const previous = byTime.get(t);
-    if (!previous || candidate.score > previous.score) byTime.set(t, candidate);
+    out.push({ t, r });
   }
-  return [...byTime.values()].sort((a, b) => a.t - b.t);
+  return out;
 }
 
 function dayKey(t) {
@@ -82,37 +74,25 @@ async function saveDayFile(day, map) {
 async function main() {
   await fs.mkdir(DIR, { recursive: true });
   const [windRaw, magRaw] = await Promise.all([
-    fetchJson(WIND_URL),
-    fetchJson(MAG_URL)
+    fetchJson(WIND_URL).catch(e => { console.warn('wind fetch failed', e); return []; }),
+    fetchJson(MAG_URL).catch(e => { console.warn('mag fetch failed', e); return []; })
   ]);
 
-  const selectedWind = preferredRows(windRaw, ['proton_speed', 'proton_density'], true);
-  if (!selectedWind.length) throw new Error('RTSW wind response has no complete speed+density rows');
-  const latestWind = selectedWind[selectedWind.length - 1];
-  console.log('Latest RTSW wind row:', JSON.stringify({
-    time_tag: latestWind.r.time_tag,
-    active: latestWind.r.active,
-    source: latestWind.r.source,
-    proton_speed: latestWind.r.proton_speed,
-    proton_density: latestWind.r.proton_density
-  }));
-  const windByT = new Map(selectedWind.map(({ t, r }) => [t, r]));
-  const magByT = new Map(preferredRows(magRaw, ['bt', 'bx_gsm', 'by_gsm', 'bz_gsm']).map(({ t, r }) => [t, r]));
+  const windByT = new Map(activeRows(windRaw).map(({ t, r }) => [t, r]));
+  const magByT = new Map(activeRows(magRaw).map(({ t, r }) => [t, r]));
   const allT = new Set([...windByT.keys(), ...magByT.keys()]);
 
   const byDay = new Map();
   for (const t of allT) {
     const w = windByT.get(t), m = magByT.get(t);
-    const speed = finiteValue(w?.proton_speed), density = finiteValue(w?.proton_density);
-    const bt = finiteValue(m?.bt), bx = finiteValue(m?.bx_gsm), by = finiteValue(m?.by_gsm), bz = finiteValue(m?.bz_gsm);
     const point = {
       t,
-      speed: speed !== null && speed >= 100 && speed <= 3000 ? speed : null,
-      density: density !== null && density >= 0.05 && density <= 500 ? density : null,
-      bt: bt !== null && bt >= 0 && bt <= 300 ? bt : null,
-      bx: bx !== null && Math.abs(bx) <= 300 ? bx : null,
-      by: by !== null && Math.abs(by) <= 300 ? by : null,
-      bz: bz !== null && Math.abs(bz) <= 300 ? bz : null
+      speed: w && Number(w.proton_speed) >= 100 && Number(w.proton_speed) <= 3000 ? Number(w.proton_speed) : null,
+      density: w && Number(w.proton_density) >= 0.05 && Number(w.proton_density) <= 500 ? Number(w.proton_density) : null,
+      bt: m && Number(m.bt) >= 0 && Number(m.bt) <= 300 ? Number(m.bt) : null,
+      bx: m && Math.abs(Number(m.bx_gsm)) <= 300 ? Number(m.bx_gsm) : null,
+      by: m && Math.abs(Number(m.by_gsm)) <= 300 ? Number(m.by_gsm) : null,
+      bz: m && Math.abs(Number(m.bz_gsm)) <= 300 ? Number(m.bz_gsm) : null
     };
     const day = dayKey(t);
     if (!byDay.has(day)) byDay.set(day, []);
@@ -141,10 +121,7 @@ async function main() {
     .sort();
   await fs.writeFile(path.join(DIR, 'manifest.json'), JSON.stringify(manifest), 'utf8');
 
-  const activeWind = windRaw.filter(row => row?.active === true).length;
-  const selectedInactiveWind = [...windByT.values()].filter(row => row?.active !== true).length;
   console.log(`Updated ${byDay.size} day file(s): ${[...byDay.keys()].join(', ')}`);
-  console.log(`Wind rows: ${windByT.size} selected (${activeWind} active source rows, ${selectedInactiveWind} inactive fallbacks)`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
