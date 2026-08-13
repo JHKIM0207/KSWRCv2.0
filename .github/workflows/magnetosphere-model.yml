@@ -44,6 +44,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: requirements-magnetosphere.txt
 
       - name: Install field-model dependencies
         run: |
