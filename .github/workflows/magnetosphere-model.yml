@@ -15,7 +15,7 @@ on:
       - .github/workflows/magnetosphere-model.yml
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -84,6 +84,19 @@ jobs:
           print(data['diagnostics'])
           PY
 
+      - name: Save latest snapshot in repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/magnetosphere/latest.json
+          if git diff --cached --quiet; then
+            echo "Snapshot is unchanged"
+          else
+            git commit -m "Update magnetosphere snapshot"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
       - name: Assemble static site
         run: |
           mkdir -p _site
@@ -93,6 +106,7 @@ jobs:
             --exclude '_site/' \
             --exclude 'scripts/' \
             --exclude 'requirements-magnetosphere.txt'
+          test -s _site/data/magnetosphere/latest.json
 
       - uses: actions/configure-pages@v5
 
