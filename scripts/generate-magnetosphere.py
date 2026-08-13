@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,13 +19,18 @@ from geopack import geopack, t96
 ROOT = Path(__file__).resolve().parents[1]
 WIND_DIR = ROOT / "data" / "wind-history"
 OUTPUT = ROOT / "data" / "magnetosphere" / "latest.json"
-NOAA_DST_URL = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
+NOAA_DST_URLS = (
+    "https://services.swpc.noaa.gov/json/geospace/geospace_dst_1_hour.json",
+    "https://services.swpc.noaa.gov/json/geospace/geospace_dst_7_day.json",
+    "https://services.swpc.noaa.gov/products/kyoto-dst.json",
+)
 MAX_INPUT_AGE = timedelta(hours=2)
 
-
 def parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 def finite(value) -> float | None:
     if value is None or isinstance(value, bool):
@@ -65,27 +71,89 @@ def recent_wind(now: datetime) -> dict:
     result["sample_count"] = len(window)
     return result
 
-
 def fetch_dst(now: datetime) -> tuple[float, datetime]:
-    request = urllib.request.Request(NOAA_DST_URL, headers={"User-Agent": "KSWRC-GitHub-Actions/1.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        rows = json.load(response)
-    candidates: list[tuple[datetime, float]] = []
-    for row in rows[1:] if rows and isinstance(rows[0], list) else rows:
-        try:
-            when = parse_time(str(row[0]))
-            value = finite(row[1])
-        except (IndexError, TypeError, ValueError):
-            continue
-        if value is not None and when <= now + timedelta(minutes=5):
-            candidates.append((when, value))
-    if not candidates:
-        raise RuntimeError("No valid Kyoto Dst value is available")
-    when, value = max(candidates, key=lambda item: item[0])
-    if now - when > timedelta(hours=4):
-        raise RuntimeError(f"Latest Dst input is stale: {when.isoformat()}")
-    return value, when
+    rows = None
+    errors = []
 
+    for url in NOAA_DST_URLS:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "KSWRC-GitHub-Actions/1.0"},
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                rows = json.load(response)
+
+            print(f"Loaded Dst input from {url}")
+            break
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as error:
+            errors.append(f"{url}: {error}")
+
+    if rows is None:
+        raise RuntimeError(
+            "All NOAA Dst sources failed: " + "; ".join(errors)
+        )
+
+    candidates: list[tuple[datetime, float]] = []
+
+    header = (
+        rows[0]
+        if rows
+        and isinstance(rows[0], list)
+        and all(isinstance(item, str) for item in rows[0])
+        else None
+    )
+
+    data_rows = rows[1:] if header else rows
+
+    for row in data_rows:
+        if header and isinstance(row, list):
+            row = dict(zip(header, row))
+
+        if isinstance(row, dict):
+            time_value = (
+                row.get("time_tag")
+                or row.get("time")
+                or row.get("timestamp")
+            )
+            dst_value = row.get("dst")
+
+        elif isinstance(row, list) and len(row) >= 2:
+            time_value = row[0]
+            dst_value = row[1]
+
+        else:
+            continue
+
+        try:
+            when = parse_time(str(time_value))
+            value = finite(dst_value)
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            value is not None
+            and when <= now + timedelta(minutes=5)
+        ):
+            candidates.append((when, value))
+
+    if not candidates:
+        raise RuntimeError("No valid Dst value is available")
+
+    when, value = max(candidates, key=lambda item: item[0])
+
+    if now - when > timedelta(hours=4):
+        raise RuntimeError(
+            f"Latest Dst input is stale: {when.isoformat()}"
+        )
+
+    return value, when
 
 def shue_parameters(pdyn: float, bz: float) -> tuple[float, float]:
     # Shue et al. (1998), Earth radii. GSM +X points sunward.
