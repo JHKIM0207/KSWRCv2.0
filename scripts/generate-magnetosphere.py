@@ -41,34 +41,126 @@ def finite(value) -> float | None:
         return None
     return number if math.isfinite(number) else None
 
-
 def recent_wind(now: datetime) -> dict:
-    points: list[dict] = []
-    for day in ((now - timedelta(days=i)).date().isoformat() for i in range(3)):
+    fields = ("speed", "density", "by", "bz")
+    series: dict[str, list[tuple[int, float]]] = {
+        key: [] for key in fields
+    }
+
+    for day in (
+        (now - timedelta(days=i)).date().isoformat()
+        for i in range(3)
+    ):
         path = WIND_DIR / f"{day}.jsonl"
+
         if not path.exists():
             continue
-        for line in path.read_text(encoding="utf-8").splitlines():
+
+        for line in path.read_text(
+            encoding="utf-8"
+        ).splitlines():
             if not line.strip():
                 continue
+
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if all(finite(row.get(key)) is not None for key in ("speed", "density", "by", "bz")):
-                points.append(row)
-    if not points:
-        raise RuntimeError("No complete solar-wind records are available")
-    points.sort(key=lambda row: row["t"])
-    latest_time = datetime.fromtimestamp(points[-1]["t"] / 1000, timezone.utc)
-    if now - latest_time > MAX_INPUT_AGE:
-        raise RuntimeError(f"Latest solar-wind input is stale: {latest_time.isoformat()}")
 
-    window_start = points[-1]["t"] - 15 * 60 * 1000
-    window = [row for row in points if row["t"] >= window_start]
-    result = {key: float(np.median([float(row[key]) for row in window])) for key in ("speed", "density", "by", "bz")}
-    result["time"] = latest_time
-    result["sample_count"] = len(window)
+            timestamp = finite(row.get("t"))
+            if timestamp is None:
+                continue
+
+            for key in fields:
+                value = finite(row.get(key))
+                if value is not None:
+                    series[key].append(
+                        (int(timestamp), value)
+                    )
+
+    missing = [
+        key for key in fields
+        if not series[key]
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "No solar-wind samples are available for: "
+            + ", ".join(missing)
+        )
+
+    for values in series.values():
+        values.sort(key=lambda item: item[0])
+
+    latest_by_field = {
+        key: values[-1][0]
+        for key, values in series.items()
+    }
+
+    stale = [
+        key
+        for key, timestamp in latest_by_field.items()
+        if now - datetime.fromtimestamp(
+            timestamp / 1000,
+            timezone.utc,
+        ) > MAX_INPUT_AGE
+    ]
+
+    if stale:
+        raise RuntimeError(
+            "Solar-wind inputs are stale for: "
+            + ", ".join(stale)
+        )
+
+    # 풍속·밀도 피드와 자기장 피드는 시각이 정확히 같지
+    # 않을 수 있으므로 공통 분석 시각을 기준으로 따로 집계한다.
+    analysis_ms = min(latest_by_field.values())
+    window_start = analysis_ms - 15 * 60 * 1000
+
+    windows = {
+        key: [
+            value
+            for timestamp, value in values
+            if window_start <= timestamp <= analysis_ms
+        ]
+        for key, values in series.items()
+    }
+
+    empty = [
+        key for key, values in windows.items()
+        if not values
+    ]
+
+    if empty:
+        raise RuntimeError(
+            "No synchronized 15-minute samples "
+            "are available for: "
+            + ", ".join(empty)
+        )
+
+    result = {
+        key: float(np.median(values))
+        for key, values in windows.items()
+    }
+
+    result["time"] = datetime.fromtimestamp(
+        analysis_ms / 1000,
+        timezone.utc,
+    )
+
+    result["sample_count"] = min(
+        len(values)
+        for values in windows.values()
+    )
+
+    print(
+        "Solar-wind samples: "
+        + ", ".join(
+            f"{key}={len(windows[key])}"
+            for key in fields
+        )
+    )
+
     return result
 
 def fetch_dst(now: datetime) -> tuple[float, datetime]:
